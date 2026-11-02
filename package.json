@@ -1,0 +1,12 @@
+{
+  "name": "switchyard-cli",
+  "version": "0.1.0",
+  "description": "Durable local task orchestration with pluggable agents and transports",
+  "type": "module",
+  "private": true,
+  "bin": { "switchyard": "dist/cli.js" },
+  "engines": { "node": ">=22.19" },
+  "scripts": { "build": "tsc", "test": "npm run build && node --test test/*.test.mjs", "demo": "npm run build && node test/demo.mjs" },
+  "devDependencies": { "@types/node": "^22.19.0", "typescript": "^5.9.3" },
+  "license": "MIT"
+}

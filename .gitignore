@@ -1,0 +1,15 @@
+node_modules/
+dist/
+coverage/
+.feature-delivery/
+.switchyard/
+*.sqlite
+*.db
+*.db-shm
+*.db-wal
+*.sqlite-shm
+*.sqlite-wal
+.env
+.env.*
+!.env.example
+.DS_Store
