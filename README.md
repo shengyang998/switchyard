@@ -17,11 +17,19 @@ npm run demo
 node dist/cli.js --help
 ```
 
-The deterministic demo runs two tasks, queues a follow-up while the first is active, receives reports, then restarts and reuses the same worker/session/worktree. It uses a command router and a **non-Codex (Claude) worker profile** through fake Herdr subprocesses, plus real temporary Git worktrees. It requires no account, network, running Herdr server, or API key, and removes its temporary files. Tests also cover close/drop/gc refusals and resumption, the disk guard, v0.1 state migration, ambiguous create/start/send, interrupted outbox writes, identity changes, duplicate/stale reports, malformed routing, concurrent supervisors, spaces in paths, and subprocess limits.
+The deterministic demo runs two tasks, queues a follow-up while the first is active, receives reports, then restarts and reuses the same worker/session/worktree. It uses a command router and a **non-Codex (Claude) worker profile** through fake Herdr subprocesses, plus real temporary Git worktrees. It requires no account, network, running Herdr server, or API key, and removes its temporary files. Tests also cover Herdr outages, restarts and agent exits (rebind, respawn, refusals), close/drop/gc refusals and resumption, the disk guard, v0.1 state migration, ambiguous create/start/send, interrupted outbox writes, identity changes, duplicate/stale reports, malformed routing, concurrent supervisors, spaces in paths, and subprocess limits.
+
+### Live Herdr smoke test (opt-in)
+
+```sh
+HERDR_BIN=/path/to/herdr npm run smoke:herdr
+```
+
+This drives a **real Herdr server** in its own named session with a scratch HOME, repository and state: two tasks and a follow-up, a Herdr restart while `serve` runs with a turn in flight, an agent exit followed by `recover --respawn`, then `close` and `gc --merged`. The worker is a deterministic stand-in (`scripts/live-herdr/agent.mjs`) that Herdr detects as `codex` and that reports its session the way Herdr's Codex integration does, so no model, account or network is used. Only for this isolated session does it run Switchyard outside a pane with `HERDR_ENV=1`, through a wrapper pinned to the test session. It is not part of `npm test`. `SMOKE_KEEP=1` keeps the scratch directory; `SMOKE_HOLD=1` leaves a failed run's session up for inspection. Last passed against Herdr 0.9.5.
 
 ## Use with Herdr
 
-Install/authenticate your chosen agent CLI yourself. The checked adapter targets **Herdr 0.8 protocol 19** and Codex CLI **0.165**. `close`/`drop` additionally use `pane get` and `pane close`, checked against Herdr 0.9.5 (protocol 22), where the other fields the adapter reads are unchanged. Run the supervisor **inside a Herdr-managed pane** (`HERDR_ENV=1`) so commands target that session. Switchyard will create a background workspace for each task; it does not control an unrelated focused pane. It refuses Herdr control outside that environment. Do not set this variable artificially to bypass the check.
+Install/authenticate your chosen agent CLI yourself. The checked adapter targets **Herdr 0.8 protocol 19** and Codex CLI **0.165**. `close`/`drop` and restart continuity additionally use `pane get`, `pane close` and `pane report-agent-session`, plus Herdr's `server_unavailable`/`agent_not_found` error codes; these were checked live against Herdr 0.9.5 (protocol 22) with the smoke test above, where the other fields the adapter reads are unchanged. Run the supervisor **inside a Herdr-managed pane** (`HERDR_ENV=1`) so commands target that session. Switchyard will create a background workspace for each task; it does not control an unrelated focused pane. It refuses Herdr control outside that environment. Do not set this variable artificially to bypass the check.
 
 Build first. The target repository must have a commit. Choose a private, external state directory, or add `.switchyard/` to the target repository's `.gitignore` before using the default. State contains task text, tokens, database files, and worktrees; never commit it.
 
@@ -79,7 +87,28 @@ node dist/cli.js --state /path/to/private-state recover
 node dist/cli.js --state /path/to/private-state history
 ```
 
-Recovery verifies exact worktree path/branch and saved transport instance/session. It never creates a replacement worker for a missing one. A process restart reuses saved identities. Interrupted create/start calls, missing integration identity, or changed occupants freeze provisioning as `unknown`. Inspect the saved task and Herdr pane yourself. If the original worker is verified, explicitly adopt its opaque reference and canonical session identity:
+Recovery verifies the exact worktree path/branch and the saved pane, agent kind, cwd and native session. A supervisor restart reuses saved identities. `recover` and `resolve` take the supervisor lock, so stop `serve` before running them.
+
+### Herdr restarts, outages and agent exits
+
+- **Herdr unreachable.** `serve`/`run` keep routing input, but launches, dispatch and lifecycle requests wait; nothing is frozen. Their output carries `transport: {ok: false, error}` until the server is back.
+- **Herdr restarted.** Herdr restores the panes and resumes each agent on its saved session in a new terminal. Switchyard accepts the new terminal only if pane, agent kind, worktree cwd and the saved native session all match, and records `rebind` in `history`. A turn that was in flight becomes `uncertain`, because the process handling it is gone; it is never resent. A late report from the resumed worker still completes it, otherwise decide with `resolve` (below).
+- **Launch arguments survive.** Herdr's own restore runs only `codex resume ID`, dropping `--sandbox`, `--add-dir STATE` and other worker args. After each launch, respawn or rebind Switchyard reports the pane's resume command to Herdr (`pane report-agent-session --source switchyard -- codex resume ID <worker args>`), so a restored worker keeps them. This is best effort: a failure is audited as `pin-failed` and the restored worker may ask for approval before its first report. If you start a different conversation in a worker pane yourself, Herdr still restores the task's session there after a restart.
+- **Agent exited.** The task keeps `provision: started` with `error: "No agent in worker pane …"`; dispatch waits and an in-flight turn becomes `uncertain`. Resume the same session:
+
+  ```sh
+  node dist/cli.js --state /path/to/private-state recover --task TASK_ID --respawn
+  ```
+
+  This starts the agent with its kind's resume command plus the configured worker args (override with a `worker.resume` argv containing `{session}`). It uses the saved pane when that pane is an idle shell in the task worktree, or a new background workspace when the pane is gone. It refuses a pane holding another agent or session, or one whose cwd has moved. The launch is write-ahead like the first one: an interrupted or ambiguous respawn, or an agent that comes back on a different session, freezes the task. Respawn never starts a fresh conversation for an existing task and never rotates its token.
+
+Anything that is not one of these cases fails closed: a different session, agent kind or cwd, a worktree/branch mismatch, or an interrupted create/start freezes provisioning as `unknown`. After checking the pane yourself, re-verify read-only against the saved pane and session (this also repairs tasks frozen by an outage under earlier versions):
+
+```sh
+node dist/cli.js --state /path/to/private-state recover --task TASK_ID
+```
+
+A launch whose identity was never observed can be adopted explicitly after you verify it:
 
 ```sh
 node dist/cli.js --state /path/to/private-state recover --task TASK_ID \
@@ -87,7 +116,7 @@ node dist/cli.js --state /path/to/private-state recover --task TASK_ID \
   --session '{"agent":"codex","kind":"id","value":"OBSERVED_SESSION_ID"}'
 ```
 
-Saved reference, instance, or session mismatches are rejected. For an ambiguous creation with no saved reference, first inspect the workspace list to identify the original workspace, then start/verify its worker as needed before adoption. The MVP does not replace dead sessions or rotate worker generations. Repair/recover the original identity or start a separate task; do not edit the database to reuse a token with a different worker.
+Saved reference or session mismatches are rejected. For an ambiguous creation with no saved reference, first inspect the workspace list to identify the original workspace, then start/verify its worker as needed before adoption. Do not edit the database to reuse a token with a different worker; start a separate task instead.
 
 A prompt timeout/nonzero exit can mean text was delivered. Such inputs become `uncertain` and are **never automatically replayed**. A correlated worker report resolves the uncertainty. Otherwise inspect the original pane/session and explicitly decide:
 
