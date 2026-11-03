@@ -4,7 +4,7 @@
   "description": "Durable local task orchestration with pluggable agents and transports",
   "type": "module",
   "private": true,
-  "bin": { "switchyard": "dist/cli.js" },
+  "bin": { "switchyard": "dist/cli.js", "sy": "dist/cli.js" },
   "engines": { "node": ">=22.19" },
   "scripts": { "build": "tsc", "test": "npm run build && node --test test/*.test.mjs", "demo": "npm run build && node test/demo.mjs", "smoke:herdr": "npm run build && node scripts/live-herdr/smoke.mjs" },
   "devDependencies": { "@types/node": "^22.19.0", "typescript": "^5.9.3" },

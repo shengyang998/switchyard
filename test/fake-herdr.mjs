@@ -40,4 +40,7 @@ if(args[0]==='workspace'&&args[1]==='create'){
  if(state.fail==='close'){save();console.error('ambiguous close');process.exit(1);}
  if(!state.agents[args[2]])fail('pane_not_found',`pane ${args[2]} not found`);
  delete state.agents[args[2]];ok({type:'ok'});
+}else if(args[0]==='notification'&&args[1]==='show'){
+ if(state.fail==='notify'){save();console.error('notification failed');process.exit(1);}
+ (state.notifications??=[]).push({title:args[2],body:option('--body')});save();
 }else throw Error(`Unsupported fake command ${JSON.stringify(args)}`);

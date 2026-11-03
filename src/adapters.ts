@@ -39,6 +39,7 @@ export interface WorkerTransport {
   start(task:Row):Promise<void>;
   resume(task:Row):Promise<void>;
   pin(task:Row):Promise<void>;
+  notify(title:string,body:string):Promise<void>;
   inspect(task:Row):Promise<Inspection>;
   probe(task:Row):Promise<Probe>;
   send(task:Row,text:string):Promise<void>;
@@ -90,6 +91,7 @@ export class HerdrTransport implements WorkerTransport {
     const s=JSON.parse(t.session),worker=this.config.worker;
     await this.raw(['pane','report-agent-session','--source','switchyard','--agent',worker.kind,s.kind==='path'?'--agent-session-path':'--agent-session-id',s.value,this.pane(t),'--',worker.command??worker.kind,...resumeArgv(worker,t.session)]);
   }
+  async notify(title:string,body:string):Promise<void> { await this.raw(['notification','show',title,'--body',body,'--sound','request']); }
   async probe(t:Row):Promise<Probe> {
     let p:Row;
     try { p=(await this.call(['pane','get',this.pane(t)])).pane; }
