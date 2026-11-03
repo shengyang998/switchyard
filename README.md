@@ -17,11 +17,11 @@ npm run demo
 node dist/cli.js --help
 ```
 
-The deterministic demo runs two tasks, queues a follow-up while the first is active, receives reports, then restarts and reuses the same worker/session/worktree. It uses a command router and a **non-Codex (Claude) worker profile** through fake Herdr subprocesses, plus real temporary Git worktrees. It requires no account, network, running Herdr server, or API key, and removes its temporary files. Tests also cover ambiguous create/start/send, interrupted outbox writes, identity changes, duplicate/stale reports, malformed routing, concurrent supervisors, spaces in paths, and subprocess limits.
+The deterministic demo runs two tasks, queues a follow-up while the first is active, receives reports, then restarts and reuses the same worker/session/worktree. It uses a command router and a **non-Codex (Claude) worker profile** through fake Herdr subprocesses, plus real temporary Git worktrees. It requires no account, network, running Herdr server, or API key, and removes its temporary files. Tests also cover close/drop/gc refusals and resumption, the disk guard, v0.1 state migration, ambiguous create/start/send, interrupted outbox writes, identity changes, duplicate/stale reports, malformed routing, concurrent supervisors, spaces in paths, and subprocess limits.
 
 ## Use with Herdr
 
-Install/authenticate your chosen agent CLI yourself. The checked adapter targets **Herdr 0.8 protocol 19** and Codex CLI **0.165**. Run the supervisor **inside a Herdr-managed pane** (`HERDR_ENV=1`) so commands target that session. Switchyard will create a background workspace for each task; it does not control an unrelated focused pane. It refuses Herdr control outside that environment. Do not set this variable artificially to bypass the check.
+Install/authenticate your chosen agent CLI yourself. The checked adapter targets **Herdr 0.8 protocol 19** and Codex CLI **0.165**. `close`/`drop` additionally use `pane get` and `pane close`, checked against Herdr 0.9.5 (protocol 22), where the other fields the adapter reads are unchanged. Run the supervisor **inside a Herdr-managed pane** (`HERDR_ENV=1`) so commands target that session. Switchyard will create a background workspace for each task; it does not control an unrelated focused pane. It refuses Herdr control outside that environment. Do not set this variable artificially to bypass the check.
 
 Build first. The target repository must have a commit. Choose a private, external state directory, or add `.switchyard/` to the target repository's `.gitignore` before using the default. State contains task text, tokens, database files, and worktrees; never commit it.
 
@@ -72,7 +72,7 @@ All four keys are required; extra keys fail validation. `action` is `new`, `foll
 
 Every input envelope contains task ID, input ID, a per-worker token, and the exact JSON argv for `report`. The worker sends `ack` on receipt, optional `progress`, and one final `ready`, `blocked`, or `failed` report with a summary and evidence. Report IDs must be unique; identical repeats are idempotent. Only the current assigned input and token are accepted. Acknowledgement confirms delivery but keeps the worker busy. Final reports release the turn; a queued follow-up then reopens that task when the transport is ready. No mid-turn steering is attempted.
 
-`--concurrency` limits **active input turns**, not total retained terminal panes. Ready/blocked workers remain available for later follow-ups. An uncertain delivery keeps its slot occupied. Retained panes/worktrees are not automatically garbage-collected.
+`--concurrency` limits **active input turns**, not total retained terminal panes. Ready/blocked workers remain available for later follow-ups. An uncertain delivery keeps its slot occupied. Retained panes and worktrees stay until you reclaim them explicitly; see [Reclaiming disk space](#reclaiming-disk-space).
 
 ```sh
 node dist/cli.js --state /path/to/private-state recover
@@ -98,6 +98,30 @@ node dist/cli.js --state /path/to/private-state resolve --event INPUT_ID --actio
 ```
 
 `delivered` keeps the input active awaiting its report. `retry` keeps the same input ID and appends a delivery attempt; it cannot undo effects from the original prompt. Resolution requires the worker to reconcile first. There is no automatic timeout that frees business work.
+
+## Reclaiming disk space
+
+Each task keeps a full checkout plus whatever its builds leave in it (`node_modules`, `target/`, `build/`, ...) until you reclaim it. Nothing is deleted automatically.
+
+```sh
+node dist/cli.js --state /path/to/private-state du                 # per-task bytes, dirty flag, free space, gc --merged estimate
+node dist/cli.js --state /path/to/private-state close --task TASK_ID
+node dist/cli.js --state /path/to/private-state drop --task TASK_ID [--into main]
+node dist/cli.js --state /path/to/private-state gc --merged --dry-run
+node dist/cli.js --state /path/to/private-state gc --merged [--into main]
+```
+
+- `close` closes the task's worker pane, removes its worktree, and **keeps the branch**. Commits stay reachable; the task leaves Router candidates and no longer accepts `submit --task`, `recover`, or scheduling.
+- `drop` does the same and then deletes `switchyard/task_…` only if it is merged into `--into` (default: the main checkout's `HEAD`). Merged means an ancestor, or every commit patch-equivalent (cherry-picked/rebased). It prints the deleted commit and `git branch NAME SHA` to restore it. A squash merge is not detectable this way; use `--discard-unmerged` after checking.
+- `gc --merged` drops every task with no active or queued input whose worktree is clean and whose branch is merged, including tasks you already closed. It prints why each other task was kept. Blocked tasks are kept because they wait for you. Use `--dry-run` first.
+
+Refusals happen before any side effect. Uncommitted or untracked changes need `--discard-changes`. An active or queued input needs `--abandon`, which marks it `abandoned`, releases its concurrency slot, and makes any late report stale. Abandoning does not stop the agent's current action; it only closes its pane if verified. Branches checked out elsewhere are never deleted. Files ignored by Git (build output) are removed with the worktree without a flag.
+
+A pane is closed only when Herdr's `pane get` still reports the saved terminal ID. A changed occupant is reported as `unverified` and left open; a missing pane is `absent`. The intent is recorded as `closing`/`dropping` before any Herdr or Git call. A failed step leaves the task in that state, out of scheduling, and rerunning the same command resumes it. If `serve` is running, these commands queue a durable request that the supervisor applies between passes, so there is never a second writer.
+
+**Disk guard.** Before creating a worktree or sending a turn, the supervisor checks free space on the filesystems holding state, worktrees, and the repository. Below `init --min-free-mb` (default 10240; 0 disables), the input stays `queued` with a `Disk guard` error and one audit record; it continues once space is freed. Existing turns are not interrupted. To change the threshold on existing state, reinitialize in a new state directory.
+
+`du` counts allocated bytes inside Switchyard worktrees and the state database. It does not see caches that agents or tools write elsewhere (Xcode DerivedData, `~/.cargo`, package-manager caches, Docker); clean those with their own tools. Redirecting `serve` output to a file also grows without bound: each pass prints the full status.
 
 State is for **one trusted local user on one host**. A SQLite transaction records a PID/hostname supervisor lock; a live PID is never displaced, even after long pauses. PID reuse can conservatively require operator investigation. No shared/network filesystem, multiple host supervision, or hostile-worker isolation is supported. Tokens prevent stale/misassigned reports, not malicious access: workers can read writable state and tokens appear in their prompt/process argv. Protect the state directory and do not route untrusted projects without your own isolation.
 
