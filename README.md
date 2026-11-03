@@ -8,7 +8,7 @@ This is an early single-host CLI MVP. It does not merge, publish, push, or insta
 
 ## Try it offline
 
-Requirements: Node **22.19+**, npm, and Git. Native `node:sqlite` may print an experimental warning on some supported Node versions. No runtime npm dependencies.
+Requirements: Node **22.19+**, npm, and Git. Native `node:sqlite` is used; the CLI hides its experimental warning. No runtime npm dependencies.
 
 ```sh
 npm ci
@@ -25,13 +25,67 @@ The deterministic demo runs two tasks, queues a follow-up while the first is act
 HERDR_BIN=/path/to/herdr npm run smoke:herdr
 ```
 
-This drives a **real Herdr server** in its own named session with a scratch HOME, repository and state: two tasks and a follow-up, a Herdr restart while `serve` runs with a turn in flight, an agent exit followed by `recover --respawn`, then `close` and `gc --merged`. The worker is a deterministic stand-in (`scripts/live-herdr/agent.mjs`) that Herdr detects as `codex` and that reports its session the way Herdr's Codex integration does, so no model, account or network is used. Only for this isolated session does it run Switchyard outside a pane with `HERDR_ENV=1`, through a wrapper pinned to the test session. It is not part of `npm test`. `SMOKE_KEEP=1` keeps the scratch directory; `SMOKE_HOLD=1` leaves a failed run's session up for inspection. Last passed against Herdr 0.9.5.
+This drives a **real Herdr server** in its own named session with a scratch HOME, repository and state: two tasks and a `sy "#1 …"` follow-up, a Herdr restart while `serve --format text --notify` runs with a turn in flight, `resolve` and an agent exit followed by `recover 1 --respawn`, both applied by the running supervisor, then `close` and `gc --merged`. It also checks the supervisor's text log and that Herdr accepted every notification. The worker is a deterministic stand-in (`scripts/live-herdr/agent.mjs`) that Herdr detects as `codex` and that reports its session the way Herdr's Codex integration does, so no model, account or network is used. Only for this isolated session does it run Switchyard outside a pane with `HERDR_ENV=1`, through a wrapper pinned to the test session. It is not part of `npm test`. `SMOKE_KEEP=1` keeps the scratch directory; `SMOKE_HOLD=1` leaves a failed run's session up for inspection. Last passed against Herdr 0.9.5.
+
+## Everyday use
+
+You need Herdr and an installed, authenticated agent CLI (Codex by default); [Use with Herdr](#use-with-herdr) lists versions, defaults and the sandbox flags workers get. Build once and put `sy` (also installed as `switchyard`) on your PATH:
+
+```sh
+npm ci && npm run build && npm link
+```
+
+Keep this checkout where it is: workers call its `dist/cli.js` to report. Then, inside your project (it needs at least one commit):
+
+```sh
+sy init      # once per repository; state goes to ~/.local/state/switchyard/<repo>-<hash>
+sy up        # in a Herdr pane: the supervisor; leave it running (Ctrl-C stops it)
+```
+
+From any other pane, anywhere in the project (subdirectories and task worktrees included):
+
+```sh
+sy "Add a JSON export command"        # → new task #1 "Add a JSON export command"
+sy "#1 also include timestamps"        # straight to task #1, no Router call
+sy                                     # inbox
+sy show 1                              # timeline, reports with evidence, next steps
+sy diff 1                              # the worker's changes against the initialized base commit
+```
+
+The inbox sorts tasks by what they need from you:
+
+```text
+Switchyard · ~/code/app · supervisor running (pid 4242)
+
+Needs you
+  #2    Add CSV import               3m  blocked: Which delimiter should be the default?  → sy "#2 <answer>"
+  #4    Fix flaky login test         1h  worker exited; its session is saved  → sy recover 4 --respawn
+
+In progress
+  #3    Upgrade the HTTP client     40s  progress: tests are running
+
+Ready for review
+  #1    Add a JSON export command    5m  Export added with tests; npm test passes  → sy diff 1
+
+2 closed task(s) not shown
+```
+
+- **Sending work.** `sy "text"` records the input and routes it immediately: if `sy up` is running, that supervisor routes it; otherwise this command does, so the Router is never called twice. It prints the outcome: a new task, a follow-up to an existing one, the Router's reply, or a routing error with the `retry-route` command. `#N text` targets task N directly. A single word is treated as a mistyped command; send it with `sy -- word`. `submit` keeps its persist-only behavior for scripts.
+- **Task references.** Tasks get short numbers in creation order. Anywhere a task is expected, `#2`, `2`, the full task ID or a unique prefix of it works, as an argument or with `--task`.
+- **Finding state.** `--state DIR` wins, then `SWITCHYARD_STATE` (set in every worker pane), then a `.switchyard/` directory or the state owning the task worktree you are in, then the per-repository default for the current Git repository (found from linked worktrees too). `sy init` uses `$XDG_STATE_HOME/switchyard/<repo>-<hash>` (`~/.local/state` without XDG), which is private and outside the repository, so nothing needs to be added to `.gitignore`.
+- **Supervisor output.** `sy up` prints one line per change you care about (`12:04:31 #1 Add a JSON export command: ready for review · Export added  → sy diff 1`), plus Herdr outages and Router replies, and raises a Herdr notification when a task starts needing you, becomes ready for review, or fails (`--no-notify` turns that off). `serve` is the same loop for scripts: JSON, printed only when the state changes; `serve --notify` adds notifications.
+- **Output format.** Commands print text on a terminal and JSON otherwise. Force either with `--json` or `--format text|json`. `status`, `history` and `report` are always JSON.
+- **While `sy up` runs.** `recover`, `recover --respawn`, `resolve`, `close`, `drop` and `gc` all work without stopping it: they either apply directly or queue a request that the running supervisor executes between passes. Only explicit `recover --ref --session` adoption still needs the supervisor stopped.
+- **Disk.** `sy du` shows what each task's worktree holds; `sy close N` and `sy drop N` reclaim one task; see [Reclaiming disk space](#reclaiming-disk-space).
+- **Finishing.** Review with `sy diff N`, merge the task branch yourself, then `sy gc --merged`. Nothing is merged, pushed or deleted automatically.
 
 ## Use with Herdr
 
 Install/authenticate your chosen agent CLI yourself. The checked adapter targets **Herdr 0.8 protocol 19** and Codex CLI **0.165**. `close`/`drop` and restart continuity additionally use `pane get`, `pane close` and `pane report-agent-session`, plus Herdr's `server_unavailable`/`agent_not_found` error codes; these were checked live against Herdr 0.9.5 (protocol 22) with the smoke test above, where the other fields the adapter reads are unchanged. Run the supervisor **inside a Herdr-managed pane** (`HERDR_ENV=1`) so commands target that session. Switchyard will create a background workspace for each task; it does not control an unrelated focused pane. It refuses Herdr control outside that environment. Do not set this variable artificially to bypass the check.
 
-Build first. The target repository must have a commit. Choose a private, external state directory, or add `.switchyard/` to the target repository's `.gitignore` before using the default. State contains task text, tokens, database files, and worktrees; never commit it.
+Build first. The target repository must have a commit. Without `--state`, `sy init` uses the private per-repository directory described in [Everyday use](#everyday-use), outside the repository. If you pick a directory yourself, keep it private and outside the repository, or add it to the repository's `.gitignore`. State contains task text, tokens, database files, and worktrees; never commit it.
+
+The same flow with explicit paths, as scripts would run it:
 
 ```sh
 npm run build
@@ -44,7 +98,7 @@ node dist/cli.js --state /path/to/private-state submit "Also include timestamps"
 node dist/cli.js --state /path/to/private-state serve --interval 2000 --passes 100
 ```
 
-`submit` durably records input and returns immediately; `run` routes pending inputs and performs one scheduling pass. Repeat `run`, or use foreground `serve`. `--passes` is bounded (serve defaults to 100000 passes); Ctrl-C requests a graceful stop after the current bounded subprocess finishes. The default subprocess timeout is 120000ms (`init --timeout MS`). `status` and `history` only read local state. Explicit `--task` bypasses the Router. Repeating an input ID with identical text and target is idempotent; conflicting reuse fails.
+`submit` durably records input and returns immediately (unlike `sy "text"`, it never routes); `run` routes pending inputs and performs one scheduling pass. Repeat `run`, or use foreground `serve`. `--passes` is bounded (serve defaults to 100000 passes); Ctrl-C requests a graceful stop after the current bounded subprocess finishes. The default subprocess timeout is 120000ms (`init --timeout MS`). `status` and `history` only read local state. Explicit `--task` bypasses the Router. Repeating an input ID with identical text and target is idempotent; conflicting reuse fails.
 
 The `--model` option sets the Router model only; worker models follow their own profile/argv. Default Router: `codex exec --json --ephemeral --ignore-user-config --sandbox read-only`, with a strict output schema and model `gpt-6.1-sol` (override `init --model MODEL`). It reuses installed CLI authentication, not a separately configured API client. Router instructions prohibit tools, but this is a prompt constraint plus a read-only sandbox, not a separate security boundary. Project instructions/rules may still apply. No global CLI configuration is changed.
 
@@ -87,7 +141,7 @@ node dist/cli.js --state /path/to/private-state recover
 node dist/cli.js --state /path/to/private-state history
 ```
 
-Recovery verifies the exact worktree path/branch and the saved pane, agent kind, cwd and native session. A supervisor restart reuses saved identities. `recover` and `resolve` take the supervisor lock, so stop `serve` before running them.
+Recovery verifies the exact worktree path/branch and the saved pane, agent kind, cwd and native session. A supervisor restart reuses saved identities. `recover`, `recover --respawn` and `resolve` work while `serve`/`sy up` runs: re-verification and respawn are queued as durable requests that the supervisor applies between passes (the command waits for the outcome), and `resolve` records your decision for it. Only `--ref`/`--session` adoption needs the supervisor stopped. Tasks can be given as `#N`, `N`, a full ID or a unique prefix, positionally (`recover 3 --respawn`) or with `--task`.
 
 ### Herdr restarts, outages and agent exits
 
@@ -150,7 +204,7 @@ A pane is closed only when Herdr's `pane get` still reports the saved terminal I
 
 **Disk guard.** Before creating a worktree or sending a turn, the supervisor checks free space on the filesystems holding state, worktrees, and the repository. Below `init --min-free-mb` (default 10240; 0 disables), the input stays `queued` with a `Disk guard` error and one audit record; it continues once space is freed. Existing turns are not interrupted. To change the threshold on existing state, reinitialize in a new state directory.
 
-`du` counts allocated bytes inside Switchyard worktrees and the state database. It does not see caches that agents or tools write elsewhere (Xcode DerivedData, `~/.cargo`, package-manager caches, Docker); clean those with their own tools. Redirecting `serve` output to a file also grows without bound: each pass prints the full status.
+`du` counts allocated bytes inside Switchyard worktrees and the state database. It does not see caches that agents or tools write elsewhere (Xcode DerivedData, `~/.cargo`, package-manager caches, Docker); clean those with their own tools. `serve` prints a status object only when something changed and `sy up` one line per change, so a redirected log grows with activity, not with uptime.
 
 State is for **one trusted local user on one host**. A SQLite transaction records a PID/hostname supervisor lock; a live PID is never displaced, even after long pauses. PID reuse can conservatively require operator investigation. No shared/network filesystem, multiple host supervision, or hostile-worker isolation is supported. Tokens prevent stale/misassigned reports, not malicious access: workers can read writable state and tokens appear in their prompt/process argv. Protect the state directory and do not route untrusted projects without your own isolation.
 

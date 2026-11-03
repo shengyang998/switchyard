@@ -12,6 +12,8 @@
 //      each worker on its saved session with the configured arguments (the pinned resume command)
 //   3. an agent exit, `recover --respawn` on the saved native session, and a follow-up to it
 //   4. close, a merge, and gc --merged
+// The supervisor runs as `serve --format text --notify` (the `sy up` log and Herdr notifications), follow-ups
+// use `sy "#N text"`, and `resolve` and `recover --respawn` are applied by that running supervisor.
 import { execFileSync, spawn } from 'node:child_process';
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -56,7 +58,7 @@ function sy(...args) {
 }
 let serve = null;
 function startServe() {
-  serve = spawn(process.execPath, [cli, '--state', state, 'serve', '--interval', '400'], { env: syEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+  serve = spawn(process.execPath, [cli, '--state', state, 'serve', '--format', 'text', '--notify', '--interval', '400'], { env: syEnv, stdio: ['ignore', 'pipe', 'pipe'] });
   serve.stdout.on('data', (d) => appendFileSync(serveLog, d)); serve.stderr.on('data', (d) => appendFileSync(serveLog, d));
 }
 async function stopServe() { if (!serve) return; const s = serve; serve = null; if (s.exitCode === null) { s.kill('SIGTERM'); await new Promise((r) => s.once('exit', r)); } }
@@ -96,7 +98,9 @@ try {
   await waitFor('both first turns ready', () => final('e-alpha') && final('e-beta'));
   let alpha = taskOf('e-alpha'), beta = taskOf('e-beta');
   check(pane(alpha) !== pane(beta), 'tasks share a pane', [alpha, beta]);
-  sy('submit', 'first follow-up', '--task', alpha.id, '--id', 'e-alpha-2');
+  check(alpha.num === 1 && beta.num === 2, 'task numbers', [alpha.num, beta.num]);
+  const routed = sy('#1 first follow-up', '--id', 'e-alpha-2');
+  check(routed.action === 'followup' && routed.task.num === 1, 'bare #1 follow-up', routed);
   await waitFor('follow-up ready', () => final('e-alpha-2'));
   check(git(alpha.worktree, 'rev-list', '--count', `main..${alpha.branch}`) === '2', 'alpha should have two worker commits');
   step('two tasks and a follow-up completed through real Herdr panes');
@@ -129,23 +133,22 @@ try {
 
   sy('submit', 'after restart', '--task', alpha.id, '--id', 'e-alpha-3');
   await waitFor('follow-up to the restored worker', () => final('e-alpha-3'));
-  await stopServe(); sy('resolve', '--event', 'e-beta-slow', '--action', 'retry'); startServe();
+  sy('resolve', '--event', 'e-beta-slow', '--action', 'retry');
   await waitFor('operator-approved retry of the interrupted turn', () => final('e-beta-slow'));
-  step('restored worker took a follow-up; interrupted turn completed after explicit retry');
+  step('restored worker took a follow-up; interrupted turn completed after explicit retry (serve kept running)');
 
   // 3. Agent exits in its pane; respawn resumes the saved native session there.
   herdr('pane', 'send-keys', pane(alpha), 'ctrl+c');
   await waitFor('Alpha shown as absent', () => /No agent in worker pane/.test(status().tasks.find((t) => t.id === alpha.id).error ?? ''), 30000);
   check(status().tasks.find((t) => t.id === alpha.id).provision === 'started', 'agent exit froze the task');
-  await stopServe();
-  const respawn = sy('recover', '--task', alpha.id, '--respawn');
+  const respawn = sy('recover', '#1', '--respawn');
   check(respawn.recovered?.worker === 'respawned' && respawn.recovered.pane === 'reused', 'respawn result', respawn.recovered);
   const respawnArgv = starts(pane(alpha)).at(-1);
   check(respawnArgv.includes(JSON.stringify(['resume', sessionId(alpha), ...workerArgs])), 'respawn argv should be resume + configured args', respawnArgv);
-  startServe();
-  sy('submit', 'after respawn', '--task', alpha.id, '--id', 'e-alpha-4');
+  check(audits('respawn', alpha.id).length === 1 && status().requests.some((r) => r.action === 'respawn' && r.state === 'done'), 'respawn should be applied by the running supervisor');
+  sy('#1 after respawn', '--id', 'e-alpha-4');
   await waitFor('follow-up to the respawned worker', () => final('e-alpha-4'));
-  step('agent exit paused the task; respawn resumed its saved session with the configured args; follow-up completed');
+  step('agent exit paused the task; respawn (through the running supervisor) resumed its saved session with the configured args; follow-up completed');
 
   // 4. Reclaim: close Beta, merge Alpha and collect it.
   const closed = sy('close', '--task', beta.id);
@@ -158,6 +161,12 @@ try {
   step('close and gc --merged closed the panes and removed the worktrees');
   const frozen = audits('uncertain');
   check(frozen.length === 0, 'unexpected freezes', frozen);
+  // The human-facing supervisor log and Herdr notifications.
+  const log = readFileSync(serveLog, 'utf8');
+  check(/ #1 Alpha: ready for review · /.test(log) && / #2 Beta: needs you · unsure whether the worker got input e-beta-slow/.test(log) && /Herdr unreachable/.test(log) && /Herdr reachable again/.test(log), 'serve text log', log);
+  check(!/notification failed/.test(log), 'herdr notification show failed', log.split('\n').filter((l) => /notification failed/.test(l)));
+  note(`serve log: ${log.trim().split('\n').length} lines; ${log.split('\n').filter((l) => / → /.test(l)).length} with a next step`);
+  step('serve --format text --notify logged transitions and raised Herdr notifications without errors');
 } catch (e) {
   failed = true; console.error(`not ok - ${e.message}`);
   console.error(`# kept ${root} (serve.log, agent.log, state/) for inspection`);

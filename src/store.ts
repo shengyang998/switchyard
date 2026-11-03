@@ -23,6 +23,12 @@ export class Store {
     // Additive, idempotent migration for v0.1 state: lifecycle is open|closing|closed|dropping|dropped.
     this.tx(() => {
       if (!this.all('PRAGMA table_info(tasks)').some(c => c.name === 'lifecycle')) this.db.exec("ALTER TABLE tasks ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'open'");
+      // Short human task numbers (#1, #2, ...), assigned in creation order and never reused.
+      if (!this.all('PRAGMA table_info(tasks)').some(c => c.name === 'num')) {
+        this.db.exec('ALTER TABLE tasks ADD COLUMN num INTEGER');
+        this.all('SELECT id FROM tasks ORDER BY created,rowid').forEach((t, i) => this.run('UPDATE tasks SET num=? WHERE id=?', i + 1, t.id));
+      }
+      this.db.exec('CREATE UNIQUE INDEX IF NOT EXISTS tasks_num ON tasks(num)');
     });
   }
   all(sql: string, ...params: any[]): Row[] { return this.db.prepare(sql).all(...params) as Row[]; }
@@ -31,14 +37,21 @@ export class Store {
   tx<T>(fn: () => T): T { this.db.exec('BEGIN IMMEDIATE'); try { const result = fn(); this.db.exec('COMMIT'); return result; } catch (e) { this.db.exec('ROLLBACK'); throw e; } }
   config(): Row { return Object.fromEntries(this.all('SELECT * FROM config').map(x => [x.key, JSON.parse(x.value)])); }
   audit(kind: string, task: string | null, event: string | null, detail: unknown) { this.run('INSERT INTO audit(kind,task,event,detail,created) VALUES(?,?,?,?,?)', kind, task, event, JSON.stringify(detail), Date.now()); }
-  lock(): () => void {
-    const owner = id('owner');
+  // The live lock holder, if any. `owner` starts with the holder's role: serve (a long-running supervisor),
+  // run (bounded passes) or cli (a one-off command).
+  holder(): Row | null {
+    const old = this.get('SELECT * FROM supervisor');
+    if (!old || old.host !== hostname()) return old ?? null;
+    try { process.kill(old.pid, 0); } catch (e: any) { if (e.code === 'ESRCH') return null; }
+    return { ...old, role: String(old.owner).split(':')[0] };
+  }
+  lock(role: 'serve' | 'run' | 'cli' = 'cli'): () => void {
+    const owner = `${role}:${id('owner')}`;
     this.tx(() => {
       const old = this.get('SELECT * FROM supervisor');
       if (old) {
         if (old.host !== hostname()) throw new Error('State belongs to another host; shared state is unsupported');
-        let alive = true; try { process.kill(old.pid, 0); } catch (e: any) { if (e.code === 'ESRCH') alive = false; }
-        if (alive) throw new Error(`Supervisor already active (pid ${old.pid}); refusing lock takeover`);
+        if (this.holder()) throw new Error(`Supervisor already active (pid ${old.pid}); refusing lock takeover`);
         this.run('DELETE FROM supervisor');
       }
       this.run('INSERT INTO supervisor VALUES(1,?,?,?,?)', process.pid, hostname(), owner, Date.now());

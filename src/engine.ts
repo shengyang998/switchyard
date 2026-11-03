@@ -33,7 +33,8 @@ export class Engine {
           if (decision.action === 'followup' && this.store.get('SELECT lifecycle FROM tasks WHERE id=?', taskId)?.lifecycle !== 'open') throw new Error('Follow-up target task is not open');
           if (decision.action === 'new') {
             taskId = id('task');
-            this.store.run('INSERT INTO tasks(id,title,branch,worktree,worker,token,created) VALUES(?,?,?,?,?,?,?)', taskId, decision.title, `switchyard/${taskId}`, join(this.store.dir, 'worktrees', taskId!), `sy-${taskId!.slice(-24)}`, randomBytes(24).toString('hex'), Date.now());
+            const num = Number(this.store.get('SELECT COALESCE(MAX(num),0)+1 n FROM tasks')!.n);
+            this.store.run('INSERT INTO tasks(id,num,title,branch,worktree,worker,token,created) VALUES(?,?,?,?,?,?,?,?)', taskId, num, decision.title, `switchyard/${taskId}`, join(this.store.dir, 'worktrees', taskId!), `sy-${taskId!.slice(-24)}`, randomBytes(24).toString('hex'), Date.now());
           }
           this.store.run('UPDATE events SET task=?,state=?,route=?,reply=?,error=NULL WHERE id=?', taskId, decision.action === 'reply' ? 'replied' : 'queued', JSON.stringify(decision), decision.reply, event.id);
           this.store.audit('routed', taskId, event.id, decision);
@@ -41,6 +42,18 @@ export class Engine {
       } catch (e: any) { this.store.run("UPDATE events SET state='route-error',error=? WHERE id=?", e.message, event.id); }
     }
   }
+  // Accepts #3, 3, a full task ID or a unique prefix of one (with or without `task_`).
+  resolveTask(ref: string): string {
+    const s = ref.trim(), n = s.replace(/^#/, '');
+    if (/^\d+$/.test(n)) { const t = this.store.get('SELECT id FROM tasks WHERE num=?', Number(n)); if (!t) throw new Error(`No task #${n}`); return t.id; }
+    if (this.store.get('SELECT 1 FROM tasks WHERE id=?', s)) return s;
+    const prefix = s.startsWith('task_') ? s : `task_${s}`;
+    const matches = s.length >= 4 ? this.store.all('SELECT id FROM tasks WHERE substr(id,1,?)=?', prefix.length, prefix) : [];
+    if (matches.length === 1) return matches[0].id;
+    throw new Error(matches.length ? `Task reference ${s} is ambiguous` : `Unknown task ${s}`);
+  }
+  // A running `serve`/`up`, not a one-off command that briefly holds the lock.
+  supervisor(): Row | null { const h = this.store.holder(); return h?.role === 'serve' ? h : null; }
   retryRoute(eventId:string) {
     this.store.tx(()=>{
       const e=this.store.get('SELECT * FROM events WHERE id=?',eventId);
@@ -243,15 +256,16 @@ export class Engine {
     this.store.audit('manual-recover',t.id,null,{ref,session});
     await this.pin({ ...t, ref }, a.session);
   }
-  openTask(taskId: string) {
+  openTask(taskId: string, request?: string) {
     const t = this.store.get('SELECT * FROM tasks WHERE id=?', taskId); if (!t) throw new Error('Unknown task');
     if (t.lifecycle !== 'open') throw new Error(`Task is ${t.lifecycle}; recovery applies only to open tasks`);
-    if (this.store.get("SELECT 1 FROM requests WHERE task=? AND state='pending'", t.id)) throw new Error('Task has a pending close/drop request');
+    const other = this.store.get("SELECT action FROM requests WHERE task=? AND state='pending' AND id IS NOT ?", t.id, request ?? null);
+    if (other) throw new Error(`Task has a pending ${other.action} request`);
     return t;
   }
   // Re-verify a frozen task against its saved pane and native session (read-only), e.g. after a transport outage.
-  async reverify(taskId: string) {
-    const t = this.openTask(taskId);
+  async reverify(taskId: string, request?: string) {
+    const t = this.openTask(taskId, request);
     if (!t.ref || !t.session) throw new Error('Task has no saved worker reference/session; use recover --task ID --ref JSON --session JSON');
     if (!['unknown', 'started'].includes(t.provision)) throw new Error(`Task provision is ${t.provision}; nothing to re-verify yet`);
     if (!(await this.worktreeValid(t))) throw new Error('Worktree/branch mismatch; repair it before recovery');
@@ -264,15 +278,15 @@ export class Engine {
   }
   // Start the agent again on its saved native session: in the saved pane if it is our worktree's shell, or in a
   // new background workspace if the pane is gone. Refuses any pane occupied by another agent or session.
-  async respawn(taskId: string) {
-    const t = this.openTask(taskId);
+  async respawn(taskId: string, request?: string) {
+    const t = this.openTask(taskId, request);
     if (!t.session) throw new Error('Task has no saved native session to resume; close it and start a new task');
     if (!['unknown', 'started'].includes(t.provision)) throw new Error(`Task provision is ${t.provision}; respawn applies to a started or frozen worker`);
     if (!(await this.worktreeValid(t))) throw new Error('Worktree/branch mismatch; repair it before recovery');
     const p = t.ref ? await this.backend.probe(t) : { pane: 'missing' as const };
     if (p.pane === 'agent') {
       if (p.session !== t.session) throw new Error(`Saved pane is occupied by ${p.agent} with ${p.session ? 'another session' : 'no reported session'}; Switchyard will not replace it. Inspect it yourself.`);
-      return { ...(await this.reverify(taskId)), pane: 'running' };
+      return { ...(await this.reverify(taskId, request)), pane: 'running' };
     }
     if (p.pane === 'shell' && resolve(p.cwd) !== resolve(t.worktree)) throw new Error(`Saved pane is now in ${p.cwd}, not the task worktree; not starting an agent there`);
     // Write-ahead: an interrupted respawn is ambiguous and freezes like any interrupted launch.
@@ -306,7 +320,7 @@ export class Engine {
     });
   }
   status() {
-    return { tasks: this.store.all('SELECT id,title,status,lifecycle,provision,branch,worktree,worker,ref,instance,session,inflight,error FROM tasks ORDER BY created,rowid'), events: this.store.all('SELECT id,text,target,task,state,route,reply,error FROM events ORDER BY created,rowid'), deliveries: this.store.all('SELECT * FROM deliveries ORDER BY created,rowid'), reports: this.store.all('SELECT id,task,event,outcome,summary,evidence,created FROM reports ORDER BY created,rowid'), requests: this.store.all('SELECT * FROM requests ORDER BY created,rowid').map(r => this.requestView(r)) };
+    return { tasks: this.store.all('SELECT id,num,title,status,lifecycle,provision,branch,worktree,worker,ref,instance,session,inflight,error FROM tasks ORDER BY created,rowid'), events: this.store.all('SELECT id,text,target,task,state,route,reply,error FROM events ORDER BY created,rowid'), deliveries: this.store.all('SELECT * FROM deliveries ORDER BY created,rowid'), reports: this.store.all('SELECT id,task,event,outcome,summary,evidence,created FROM reports ORDER BY created,rowid'), requests: this.store.all('SELECT * FROM requests ORDER BY created,rowid').map(r => this.requestView(r)) };
   }
   diskGuard() {
     const minFree = Number(this.config.minFreeMb ?? DEFAULT_MIN_FREE_MB) * 1024 * 1024;
@@ -325,7 +339,7 @@ export class Engine {
   requestView(r: Row): Row { return { ...r, options: JSON.parse(r.options), result: r.result ? JSON.parse(r.result) : null }; }
   // Lifecycle changes are durable requests. Only the supervisor-lock holder executes them, so they never
   // race provisioning or dispatch; a CLI without a running supervisor takes the lock and executes directly.
-  request(taskId: string, action: 'close' | 'drop', options: Row): Row {
+  request(taskId: string, action: 'close' | 'drop' | 'recover' | 'respawn', options: Row): Row {
     return this.store.tx(() => {
       const t = this.store.get('SELECT * FROM tasks WHERE id=?', taskId);
       if (!t) throw new Error('Unknown task');
@@ -347,6 +361,7 @@ export class Engine {
   // Read-only validation first; then the intent (closing/dropping) is persisted before any external effect.
   // A failure after that keeps the task out of scheduling, and rerunning the command resumes idempotently.
   async applyRequest(r: Row) {
+    if (r.action === 'recover' || r.action === 'respawn') return this.applyRecovery(r);
     const o = JSON.parse(r.options), drop = r.action === 'drop', t = this.store.get('SELECT * FROM tasks WHERE id=?', r.task)!;
     let started = false;
     try {
@@ -373,7 +388,7 @@ export class Engine {
         return n;
       });
       started = true;
-      const result: Row = { action: r.action, task: t.id, title: t.title, abandoned };
+      const result: Row = { action: r.action, task: t.id, num: t.num, title: t.title, abandoned };
       if (teardown) {
         result.worker = t.ref ? await this.backend.close(t) : t.provision === 'unknown'
           ? { worker: 'unrecorded', detail: `No saved worker reference; close any Herdr workspace labelled ${t.worker} yourself` }
@@ -402,6 +417,11 @@ export class Engine {
         this.store.audit(`${r.action}-${started ? 'failed' : 'rejected'}`, t.id, null, { request: r.id, error: e.message });
       });
     }
+  }
+  // recover/respawn requested while a supervisor runs: executed by that supervisor between passes.
+  async applyRecovery(r: Row) {
+    try { this.finish(r, 'done', r.action === 'respawn' ? await this.respawn(r.task, r.id) : await this.reverify(r.task, r.id)); }
+    catch (e: any) { this.finish(r, 'failed', null, e.message); this.store.audit(`${r.action}-failed`, r.task, null, { request: r.id, error: e.message }); }
   }
   async facts(t: Row, into?: string, list?: Worktree[]): Promise<Facts> {
     list ??= await worktrees(this.config.repo);
@@ -447,9 +467,9 @@ export class Engine {
     const list = await worktrees(this.config.repo), eligible: Row[] = [], skipped: Row[] = [];
     for (const t of this.store.all("SELECT * FROM tasks WHERE lifecycle!='dropped' ORDER BY created,rowid")) {
       const v = await this.gcVerdict(t, into, list);
-      if (v.reason) { skipped.push({ task: t.id, title: t.title, reason: v.reason }); continue; }
+      if (v.reason) { skipped.push({ task: t.id, num: t.num, title: t.title, reason: v.reason }); continue; }
       const bytes = v.facts!.exists ? usage(t.worktree).bytes : 0;
-      eligible.push({ task: t.id, title: t.title, branch: t.branch, sha: v.facts!.sha, bytes, human: human(bytes) });
+      eligible.push({ task: t.id, num: t.num, title: t.title, branch: t.branch, sha: v.facts!.sha, bytes, human: human(bytes) });
     }
     return { into, eligible, skipped };
   }
@@ -461,7 +481,7 @@ export class Engine {
     for (const t of tasks) {
       const v = await this.gcVerdict(t, head, list), f = v.facts ?? await this.facts(t, head, list).catch(() => undefined);
       const exists = existsSync(t.worktree), u = exists ? usage(t.worktree) : { bytes: 0, files: 0 };
-      rows.push({ id: t.id, title: t.title, lifecycle: t.lifecycle, status: t.status, worktree: t.worktree, exists, bytes: u.bytes, human: human(u.bytes), files: u.files,
+      rows.push({ id: t.id, num: t.num, title: t.title, lifecycle: t.lifecycle, status: t.status, worktree: t.worktree, exists, bytes: u.bytes, human: human(u.bytes), files: u.files,
         dirty: f?.dirty ?? null, branch: t.branch, branchExists: f ? !!f.sha : null, mergedIntoHead: f?.merged ?? null, gc: v.reason ? `kept: ${v.reason}` : 'reclaimable' });
     }
     rows.sort((a, b) => b.bytes - a.bytes);
