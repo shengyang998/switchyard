@@ -34,7 +34,11 @@ export interface WorkerTransport {
   start(task:Row):Promise<void>;
   inspect(task:Row):Promise<{instance:string;session:string;ready:boolean;status:string}>;
   send(task:Row,text:string):Promise<void>;
+  close(task:Row):Promise<WorkerClose>;
 }
+// closed: verified worker closed; absent: already gone; unverified: occupant not proven to be ours, left untouched.
+export type WorkerClose = { worker: 'closed' | 'absent' | 'unverified'; detail?: string };
+const herdrCode = (e: any) => /"code"\s*:\s*"([a-z_]+)"/.exec(String(e?.message))?.[1];
 export class HerdrTransport implements WorkerTransport {
   constructor(public config: Row) {}
   preflight():void {if(process.env.HERDR_ENV!=='1')throw new Error('Herdr control requires HERDR_ENV=1; run inside a Herdr managed pane');}
@@ -53,6 +57,17 @@ export class HerdrTransport implements WorkerTransport {
   }
   async start(t:Row):Promise<void> { await this.call(['agent','start',t.worker,'--kind',this.config.worker.kind,'--pane',this.pane(t),'--',...this.config.worker.args]); }
   async send(t:Row,text:string):Promise<void> { await this.call(['agent','prompt',this.pane(t),text]); }
+  // Verify by pane, not agent: `agent get` also fails after the agent exits while its pane remains.
+  async close(t:Row):Promise<WorkerClose> {
+    const pane=this.pane(t);
+    let info:Row;
+    try { info=(await this.call(['pane','get',pane])).pane; }
+    catch(e:any) { if(herdrCode(e)==='pane_not_found') return {worker:'absent'}; throw e; }
+    if(!info||info.pane_id!==pane||!t.instance||info.terminal_id!==t.instance) return {worker:'unverified',detail:`Pane ${pane} is not the saved worker terminal; left open. Close it yourself if it belongs to ${t.worker}.`};
+    try { await this.call(['pane','close',pane]); }
+    catch(e:any) { if(herdrCode(e)==='pane_not_found') return {worker:'absent'}; throw e; }
+    return {worker:'closed'};
+  }
   async inspect(task: Row) {
     const pane=this.pane(task), result = await this.call(['agent', 'get', pane]);
     const a = result.agent, s=a?.agent_session;

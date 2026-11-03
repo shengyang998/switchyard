@@ -18,7 +18,12 @@ export class Store {
       CREATE TABLE IF NOT EXISTS deliveries (id TEXT PRIMARY KEY,event TEXT NOT NULL REFERENCES events(id),task TEXT NOT NULL REFERENCES tasks(id),state TEXT NOT NULL,attempt INTEGER NOT NULL,detail TEXT,created INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY,task TEXT NOT NULL,event TEXT NOT NULL,token TEXT NOT NULL,outcome TEXT NOT NULL,summary TEXT NOT NULL,evidence TEXT NOT NULL,created INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS audit (seq INTEGER PRIMARY KEY,kind TEXT NOT NULL,task TEXT,event TEXT,detail TEXT NOT NULL,created INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS supervisor (singleton INTEGER PRIMARY KEY CHECK(singleton=1),pid INTEGER NOT NULL,host TEXT NOT NULL,owner TEXT NOT NULL,started INTEGER NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS supervisor (singleton INTEGER PRIMARY KEY CHECK(singleton=1),pid INTEGER NOT NULL,host TEXT NOT NULL,owner TEXT NOT NULL,started INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY,task TEXT NOT NULL REFERENCES tasks(id),action TEXT NOT NULL,options TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'pending',result TEXT,error TEXT,created INTEGER NOT NULL,finished INTEGER);`);
+    // Additive, idempotent migration for v0.1 state: lifecycle is open|closing|closed|dropping|dropped.
+    this.tx(() => {
+      if (!this.all('PRAGMA table_info(tasks)').some(c => c.name === 'lifecycle')) this.db.exec("ALTER TABLE tasks ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'open'");
+    });
   }
   all(sql: string, ...params: any[]): Row[] { return this.db.prepare(sql).all(...params) as Row[]; }
   get(sql: string, ...params: any[]): Row | undefined { return this.db.prepare(sql).get(...params) as Row | undefined; }
