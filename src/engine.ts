@@ -2,13 +2,16 @@ import { existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { Store, id, type Row } from './store.js';
-import { transport, route, type WorkerTransport } from './adapters.js';
+import { transport, route, TransportUnavailable, WorkerAbsent, type Inspection, type WorkerTransport } from './adapters.js';
 import { command } from './process.js';
 import { DEFAULT_MIN_FREE_MB, freeSpace, human, usage } from './disk.js';
 import { commitOf, dirty, merged, worktrees, type Worktree } from './git.js';
 type Facts = { registered: boolean; exists: boolean; stray: boolean; dirty: boolean; sha: string | null; merged: boolean | null; checkedOut: string[] };
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 export class Engine {
   config: Row; backend: WorkerTransport;
+  // Set by reconcile when the transport server is unreachable; scheduling and lifecycle work wait for it.
+  offline: string | null = null;
   constructor(public store: Store) { this.config = store.config(); if (!this.config.repo) throw new Error('Run init first'); this.backend = transport(this.config); }
   async submit(text: string, target?: string, key = id('input')) {
     if (!text.trim()) throw new Error('Input must not be empty');
@@ -55,6 +58,7 @@ export class Engine {
     this.store.audit('uncertain', t.id, t.inflight ?? null, String(error));
   }
   async provision(t: Row): Promise<Row | undefined> {
+    let launched = false;
     try {
       if (t.provision === 'new') {
         this.store.run("UPDATE tasks SET provision='worktree' WHERE id=?", t.id);
@@ -73,11 +77,11 @@ export class Engine {
         this.store.run("UPDATE tasks SET provision='starting' WHERE id=?", t.id);
         await this.backend.start(t);
         this.store.run("UPDATE tasks SET provision='started' WHERE id=?", t.id);
-        t.provision = 'started';
+        t.provision = 'started'; launched = true;
       }
       if (t.provision === 'started') {
-        const a = await this.backend.inspect(t);
-        this.store.run("UPDATE tasks SET instance=?,session=?,error=NULL WHERE id=?", a.instance, a.session, t.id);
+        // An existing worker is inspected by the dispatcher; only a fresh launch waits for its session report.
+        if (launched) { const a = await this.settle(t); this.adopt(t, a, 'rebind'); await this.pin(t, a.session); }
         return this.store.get('SELECT * FROM tasks WHERE id=?', t.id);
       }
     } catch (e: any) { this.freeze(t, e.message); }
@@ -96,9 +100,57 @@ export class Engine {
       try {
         if (!(await this.worktreeValid(t))) throw new Error('Worktree/branch does not match saved task');
         const a = await this.backend.inspect(t);
-        this.store.run('UPDATE tasks SET instance=?,session=?,error=NULL WHERE id=?', a.instance, a.session, t.id);
-      } catch (e: any) { this.freeze(t, e.message); }
+        this.adopt(t, a, 'rebind');
+        if (a.rebound) await this.pin(t, a.session);
+      } catch (e: any) {
+        // An unreachable server says nothing about worker identity: wait for it instead of freezing every task.
+        if (e instanceof TransportUnavailable) { if (this.offline !== e.message) this.store.audit('transport-offline', null, null, e.message); this.offline = e.message; return; }
+        if (e instanceof WorkerAbsent) { this.absent(t, e.message); continue; }
+        this.freeze(t, e.message);
+      }
     }
+    if (this.offline) this.store.audit('transport-online', null, null, this.offline);
+    this.offline = null;
+  }
+  // Inspect right after a launch: the agent's integration may report its native session a moment after readiness.
+  async settle(t: Row): Promise<Inspection> {
+    const until = Date.now() + Math.min(this.config.timeout, 15000);
+    for (;;) {
+      try { return await this.backend.inspect(t); }
+      catch (e: any) { if (!(e instanceof WorkerAbsent || /Missing\/mismatched worker pane\/session identity/.test(e.message)) || Date.now() > until) throw e; await sleep(500); }
+    }
+  }
+  // Record a verified inspection. A rebound worker (same pane and native session on a new terminal) lost the
+  // process that was handling any in-flight turn, so that turn becomes uncertain for the operator; never resent.
+  adopt(t: Row, a: Inspection, kind: string, detail: Row = {}) {
+    this.store.tx(() => {
+      this.store.run('UPDATE tasks SET instance=?,session=?,error=NULL WHERE id=?', a.instance, a.session, t.id);
+      if (a.rebound) this.store.audit(kind, t.id, t.inflight ?? null, { from: t.instance, to: a.instance, session: a.session, ...detail });
+      if (a.rebound && t.inflight) this.interrupt(t.id, 'Worker restarted during this turn; its progress is unknown');
+    });
+  }
+  // No agent (or no reported session) in the saved pane. Its process is gone or not yet restored, so an in-flight
+  // turn is no longer being worked on; a late report from a restored worker is still accepted.
+  absent(t: Row, reason: string) {
+    if (t.error === reason) return;
+    this.store.tx(() => {
+      this.store.run('UPDATE tasks SET error=? WHERE id=?', reason, t.id);
+      this.store.audit('worker-absent', t.id, t.inflight ?? null, reason);
+      if (t.inflight) this.interrupt(t.id, 'Worker left its pane during this turn');
+    });
+  }
+  // Best effort: without the pin a Herdr restart still resumes the session, only without the configured arguments.
+  async pin(t: Row, session: string) {
+    try { await this.backend.pin({ ...t, session }); }
+    catch (e: any) { this.store.audit('pin-failed', t.id, null, e.message); }
+  }
+  interrupt(taskId: string, reason: string) {
+    const t = this.store.get('SELECT inflight FROM tasks WHERE id=?', taskId), e = t?.inflight && this.store.get('SELECT * FROM events WHERE id=?', t.inflight);
+    if (!e || !['sending', 'sent', 'acked'].includes(e.state)) return;
+    const hint = `${reason}. Inspect the worker, then resolve --event ${e.id} --action delivered (keep waiting for its report) or --action retry (send the input again).`;
+    this.store.run("UPDATE events SET state='uncertain',error=? WHERE id=?", hint, e.id);
+    this.store.run("UPDATE deliveries SET state='uncertain',detail=? WHERE event=? AND state IN ('sending','sent','confirmed')", reason, e.id);
+    this.store.audit('interrupted', taskId, e.id, reason);
   }
   prompt(t: Row, event: Row) {
     const argv = [process.execPath, this.config.cli, '--state', this.store.dir, 'report', '--task', t.id, '--token', t.token, '--event', event.id, '--id', '<unique-report-id>', '--outcome', '<ack|progress|blocked|ready|failed>', '--summary', '<summary>', '--evidence', '<evidence>'];
@@ -106,6 +158,8 @@ export class Engine {
   }
   async pass() {
     await this.reconcile();
+    // Routing needs no transport; worker, lifecycle and scheduling work waits until the server is back.
+    if (this.offline) { await this.routePending(); return { ...this.status(), transport: { ok: false, error: this.offline } }; }
     await this.applyRequests();
     await this.routePending();
     let active = Number(this.store.get('SELECT count(*) n FROM tasks WHERE inflight IS NOT NULL')!.n);
@@ -121,6 +175,7 @@ export class Engine {
       try {
         // A final report can arrive while the UI is still leaving its prior turn.
         const a = await this.backend.inspect(t);
+        if (a.rebound) { this.adopt(t, a, 'rebind'); await this.pin(t, a.session); continue; }
         if (!a.ready || !['idle', 'done'].includes(a.status)) continue;
         const delivery = id('delivery');
         const dispatched = this.store.tx(() => {
@@ -147,9 +202,13 @@ export class Engine {
             this.store.run("UPDATE events SET state='uncertain',error=? WHERE id=? AND state='sending'", e.message, event.id);
           });
         }
-      } catch (e: any) { this.freeze(t, e.message); }
+      } catch (e: any) {
+        if (e instanceof TransportUnavailable) { this.offline = e.message; break; }
+        if (e instanceof WorkerAbsent) { this.absent(t, e.message); continue; }
+        this.freeze(t, e.message);
+      }
     }
-    return this.status();
+    return this.offline ? { ...this.status(), transport: { ok: false, error: this.offline } } : this.status();
   }
   report(r: Row) {
     if (!['ack', 'progress', 'blocked', 'ready', 'failed'].includes(r.outcome) || ![r.id,r.task,r.token,r.event,r.summary,r.evidence].every(x => typeof x === 'string' && x.length > 0)) throw new Error('Invalid report fields/outcome');
@@ -179,8 +238,60 @@ export class Engine {
     if (t.session && t.session !== session) throw new Error('Recovery cannot replace a saved worker session');
     const a = await this.backend.inspect({ ...t, ref, session });
     // Preserve the task token and inflight event: adopting a verified same logical worker is not a new generation.
-    this.store.run("UPDATE tasks SET ref=?,instance=?,session=?,provision='started',error=NULL WHERE id=?",ref,a.instance,session,t.id);
+    this.store.run("UPDATE tasks SET ref=?,provision='started' WHERE id=?",ref,t.id);
+    this.adopt({ ...t, ref }, a, 'manual-rebind');
     this.store.audit('manual-recover',t.id,null,{ref,session});
+    await this.pin({ ...t, ref }, a.session);
+  }
+  openTask(taskId: string) {
+    const t = this.store.get('SELECT * FROM tasks WHERE id=?', taskId); if (!t) throw new Error('Unknown task');
+    if (t.lifecycle !== 'open') throw new Error(`Task is ${t.lifecycle}; recovery applies only to open tasks`);
+    if (this.store.get("SELECT 1 FROM requests WHERE task=? AND state='pending'", t.id)) throw new Error('Task has a pending close/drop request');
+    return t;
+  }
+  // Re-verify a frozen task against its saved pane and native session (read-only), e.g. after a transport outage.
+  async reverify(taskId: string) {
+    const t = this.openTask(taskId);
+    if (!t.ref || !t.session) throw new Error('Task has no saved worker reference/session; use recover --task ID --ref JSON --session JSON');
+    if (!['unknown', 'started'].includes(t.provision)) throw new Error(`Task provision is ${t.provision}; nothing to re-verify yet`);
+    if (!(await this.worktreeValid(t))) throw new Error('Worktree/branch mismatch; repair it before recovery');
+    const a = await this.backend.inspect(t);
+    this.store.run("UPDATE tasks SET provision='started' WHERE id=?", t.id);
+    this.adopt(t, a, 'manual-rebind');
+    this.store.audit('manual-reverify', t.id, null, { rebound: a.rebound });
+    await this.pin(t, a.session);
+    return { task: t.id, worker: a.rebound ? 'rebound' : 'verified' };
+  }
+  // Start the agent again on its saved native session: in the saved pane if it is our worktree's shell, or in a
+  // new background workspace if the pane is gone. Refuses any pane occupied by another agent or session.
+  async respawn(taskId: string) {
+    const t = this.openTask(taskId);
+    if (!t.session) throw new Error('Task has no saved native session to resume; close it and start a new task');
+    if (!['unknown', 'started'].includes(t.provision)) throw new Error(`Task provision is ${t.provision}; respawn applies to a started or frozen worker`);
+    if (!(await this.worktreeValid(t))) throw new Error('Worktree/branch mismatch; repair it before recovery');
+    const p = t.ref ? await this.backend.probe(t) : { pane: 'missing' as const };
+    if (p.pane === 'agent') {
+      if (p.session !== t.session) throw new Error(`Saved pane is occupied by ${p.agent} with ${p.session ? 'another session' : 'no reported session'}; Switchyard will not replace it. Inspect it yourself.`);
+      return { ...(await this.reverify(taskId)), pane: 'running' };
+    }
+    if (p.pane === 'shell' && resolve(p.cwd) !== resolve(t.worktree)) throw new Error(`Saved pane is now in ${p.cwd}, not the task worktree; not starting an agent there`);
+    // Write-ahead: an interrupted respawn is ambiguous and freezes like any interrupted launch.
+    this.store.tx(() => { this.store.audit('respawn-start', t.id, t.inflight ?? null, { pane: p.pane }); this.interrupt(t.id, 'Worker was restarted on its saved session during this turn'); });
+    let current = { ...t };
+    try {
+      if (p.pane === 'missing') {
+        this.store.run("UPDATE tasks SET provision='creating',error=NULL WHERE id=?", t.id);
+        const ref = await this.backend.create(current, this.store.dir);
+        this.store.run("UPDATE tasks SET ref=?,provision='created' WHERE id=?", ref, t.id); current.ref = ref;
+      }
+      this.store.run("UPDATE tasks SET provision='starting',error=NULL WHERE id=?", t.id);
+      await this.backend.resume(current);
+      this.store.run("UPDATE tasks SET provision='started' WHERE id=?", t.id);
+      const a = await this.settle(current);
+      this.adopt(current, { ...a, rebound: true }, 'respawn', { pane: p.pane });
+    } catch (e: any) { this.freeze(current, e.message); throw e; }
+    await this.pin(current, t.session);
+    return { task: t.id, worker: 'respawned', pane: p.pane === 'missing' ? 'created' : 'reused' };
   }
   resolveDelivery(eventId: string, action: string) {
     if (!['retry','delivered'].includes(action)) throw new Error('Action must be retry or delivered');

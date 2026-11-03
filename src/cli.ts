@@ -17,6 +17,8 @@ Usage: node dist/cli.js [--state DIR] COMMAND [options]
   status                                  JSON state, no live control
   report --task ID --token TOKEN --event ID --id ID --outcome OUTCOME --summary TEXT --evidence TEXT
   recover                                 inspect saved workers, freeze ambiguity
+  recover --task ID                       re-verify a frozen task against its saved pane + session
+  recover --task ID --respawn             resume the saved agent session (saved pane or a new one)
   recover --task ID --ref JSON --session JSON explicit verified adoption
   resolve --event ID --action retry|delivered (after operator inspection)
   retry-route --event ID                   explicitly retry failed classification
@@ -28,7 +30,7 @@ Usage: node dist/cli.js [--state DIR] COMMAND [options]
                                           close, then delete the branch if merged into REF (HEAD)
   gc --merged [--into REF] [--dry-run]    drop every finished, clean task merged into REF (HEAD)
 Default state: .switchyard in current directory. No automatic merge/push/publication.`;
-const booleans = new Set(['abandon','discard-changes','discard-unmerged','merged','dry-run']);
+const booleans = new Set(['abandon','discard-changes','discard-unmerged','merged','dry-run','respawn']);
 const required = (name:string) => { if (!flags[name]) throw new Error(`Missing --${name}`); return flags[name]; };
 function integer(value: string | undefined, fallback:number) { const n = value === undefined ? fallback : Number(value); if (!Number.isInteger(n)||n<1||n>86400000) throw new Error('Expected positive bounded integer'); return n; }
 function nonNegative(value: string | undefined, fallback:number) { const n = value === undefined ? fallback : Number(value); if (!Number.isInteger(n)||n<0||n>1e9) throw new Error('Expected non-negative bounded integer'); return n; }
@@ -36,7 +38,7 @@ const sleep = (ms:number) => new Promise(r=>setTimeout(r,ms));
 function argv(value:string) { const a = JSON.parse(value); if (!Array.isArray(a)||!a.every(x=>typeof x==='string')||!a.length) throw new Error('Expected nonempty JSON argv array'); return a; }
 let store: Store | undefined;
 try {
-  const commands:Record<string,string[]>={init:['repo','concurrency','model','router-command','worker-kind','worker-args','herdr','codex','timeout','min-free-mb'],du:['task'],close:['task','abandon','discard-changes'],drop:['task','into','abandon','discard-changes','discard-unmerged'],gc:['merged','into','dry-run'],submit:['task','id'],run:['passes','interval'],serve:['passes','interval'],status:[],history:[],report:['task','token','event','id','outcome','summary','evidence'],recover:['task','ref','session'],resolve:['event','action'],'retry-route':['event'],help:[]};
+  const commands:Record<string,string[]>={init:['repo','concurrency','model','router-command','worker-kind','worker-args','herdr','codex','timeout','min-free-mb'],du:['task'],close:['task','abandon','discard-changes'],drop:['task','into','abandon','discard-changes','discard-unmerged'],gc:['merged','into','dry-run'],submit:['task','id'],run:['passes','interval'],serve:['passes','interval'],status:[],history:[],report:['task','token','event','id','outcome','summary','evidence'],recover:['task','ref','session','respawn'],resolve:['event','action'],'retry-route':['event'],help:[]};
   if(args.includes('--help')||args.includes('-h')) positional.push('help');
   else for(let i=0;i<args.length;i++) {
     if(args[i]==='--'){positional.push(...args.slice(i+1));break;}
@@ -59,7 +61,10 @@ try {
     if(flags['worker-kind']&&!/^[a-z][a-z0-9_-]*$/.test(flags['worker-kind'])) throw new Error('Invalid worker kind');
   }
   if(cmd==='run'||cmd==='serve'){integer(flags.passes,1);integer(flags.interval,2000);}
-  if(cmd==='recover'&&flags.task){required('ref');required('session');}
+  if(cmd==='recover'){
+    if((flags.ref||flags.session||flags.respawn)&&!flags.task) throw new Error('recover options require --task');
+    if(flags.ref||flags.session){required('ref');required('session');if(flags.respawn)throw new Error('--respawn cannot be combined with --ref/--session');}
+  }
   if(cmd==='report') for(const key of commands.report) required(key);
   if(cmd==='resolve'){required('event');if(!['retry','delivered'].includes(required('action')))throw new Error('Invalid resolution action');}
   if(cmd==='retry-route')required('event');
@@ -122,7 +127,15 @@ try {
         const unlock=store.lock();
         try {
           if(cmd==='retry-route') { engine.retryRoute(required('event')); output=engine.status(); }
-          else if(cmd==='recover') { await engine.reconcile(); if(flags.task) await engine.recover(flags.task,required('ref'),required('session')); output=engine.status(); }
+          else if(cmd==='recover') {
+            await engine.reconcile();
+            if(flags.task&&engine.offline) throw new Error(`${engine.offline}; start Herdr, then retry`);
+            let recovered:unknown;
+            if(flags.task&&flags.respawn) recovered=await engine.respawn(flags.task);
+            else if(flags.task&&flags.ref) await engine.recover(flags.task,required('ref'),required('session'));
+            else if(flags.task) recovered=await engine.reverify(flags.task);
+            output={...(recovered?{recovered}:{}),...engine.status(),...(engine.offline?{transport:{ok:false,error:engine.offline}}:{})};
+          }
           else if(cmd==='resolve') { await engine.reconcile(); engine.resolveDelivery(required('event'),required('action')); output=engine.status(); }
           else {
             const passes=integer(flags.passes,cmd==='serve'?100000:1),interval=integer(flags.interval,2000);
